@@ -1,0 +1,248 @@
+#!/bin/sh
+# shellcheck disable=SC2039
+
+###### GLOBAL VARIABLES #######################################################
+
+# variables
+USER=""
+PASS=""
+SITE=""
+PATH_EXPORTS=""
+PATH_SAVE_TO=""
+
+PATH_CFG="$HOME/.qsm-to"
+WEBTEMP="$PATH_CFG/webtemp"
+FILE_CACHE_LOGIN="cache-login.html"
+FILE_CACHE_QSMEXP="cache-qsmexp.html"
+FILE_COOKIE_LOGIN="cookie-login.txt"
+FILE_CFG="$PATH_CFG/qsm-to-qsmcsv.cfg"
+PARAMETER="$1"
+
+###### FUNCTIONS ##############################################################
+
+# logging
+debug() {
+    if [ "$PARAMETER" = "debug" ]; then
+        echo "$1"
+    fi
+}
+
+# read config file
+load_config() {
+    debug "load_config()"
+    local VARIABLE_NAME
+    local SETTING
+    local LINE
+
+    while read -r LINE; do
+        VARIABLE_NAME=$(echo "$LINE" | cut -d '=' -f 1)
+        SETTING=$(echo "$LINE" | cut -d '=' -f 2)
+        case $VARIABLE_NAME in
+        "USER")
+            USER=$SETTING
+            ;;
+        "PASS")
+            PASS=$SETTING
+            ;;
+        "SITE")
+            SITE=$SETTING
+            ;;
+        "PATH_EXPORTS")
+            PATH_EXPORTS=$SETTING
+            ;;
+        "PATH_SAVE_TO")
+            PATH_SAVE_TO=$SETTING
+            ;;
+        esac
+    done <"$FILE_CFG"
+
+    # verify
+    if [ -z "${USER}" ] ||
+        [ -z "${PASS}" ] ||
+        [ -z "${SITE}" ] ||
+        [ -z "${PATH_EXPORTS}" ] ||
+        [ -z "${PATH_SAVE_TO}" ]; then
+        echo " Missing variable in config file"
+        exit 1
+    fi
+    # create required folders
+    mkdir -p "$PATH_EXPORTS" "$PATH_SAVE_TO" || exit 1
+}
+
+# login to Wordpress
+login_to_wordpress() {
+    debug "login_to_wordpress()"
+    curl -s \
+        "$SITE/wp-login.php" \
+        --cookie-jar $FILE_COOKIE_LOGIN \
+        --form log="$USER" \
+        --form pwd="$PASS" \
+        --form testcookie=1 \
+        --form wp-submit="Log In" \
+        --form submit=login \
+        --output $FILE_CACHE_LOGIN
+    wait
+    # verify
+    if ! grep -q "Username or Email" $FILE_CACHE_LOGIN; then
+        echo " Error during login"
+        exit 1
+    fi
+}
+
+# download QSM export site
+qsm_export_download_site() {
+    curl -s \
+        "$SITE/wp-admin/admin.php?page=qmn_addons&tab=export-results" \
+        --cookie $FILE_COOKIE_LOGIN \
+        --output $FILE_CACHE_QSMEXP
+    wait
+}
+
+# find nonce for QSM export
+qsm_export_get_nonce() {
+    local NONCE
+
+    # you can reuse the same nonce, but this might change so we keep the code
+    #qsm_export_download_site
+
+    # find a new "cryptographic number once" in site
+    NONCE=$(grep <$FILE_CACHE_QSMEXP "export_results_nonce" |
+        awk '{print $5}' |
+        sed -e 's/"//g' -e 's/value=//g')
+
+    # return
+    echo "$NONCE"
+}
+
+# exporting single quiz to csv via QSM export
+qsm_export_single_quiz_to_csv() {
+    debug "qsm_export_single_quiz_to_csv() QUIZ_ID = $1"
+
+    # parameters
+    local QUIZ_ID="$1"
+    local COOKIE_WP_ID
+    local COOKIE_WP_ID_AUTH
+    local COOKIE_WP_LI
+    local COOKIE_WP_LI_AUTH
+    local FILE_CACHE_QSMDONE="cache-qsmexp-done.html"
+    local NONCE
+
+    # generate a new nonce
+    NONCE=$(qsm_export_get_nonce)
+    # verify
+    if [ -z "${NONCE}" ]; then
+        echo " Error during finding nonce"
+        exit 1
+    fi
+
+    # download export results site
+    # work around a curl bug
+    # if you use the parameter "--cookie", curl will append an equal(=) sign
+    # at the end of the hash that will mess up the command
+    # workaround is to assemble the header manually
+    COOKIE_WP_ID=$(grep <$FILE_COOKIE_LOGIN "wordpress_" |
+        grep "wp-admin" |
+        awk '{print $6}')
+    COOKIE_WP_ID_AUTH=$(grep <$FILE_COOKIE_LOGIN "wordpress_" |
+        grep "wp-admin" |
+        awk '{print $7}')
+    COOKIE_WP_LI=$(grep <$FILE_COOKIE_LOGIN "wordpress_logged_in" |
+        awk '{print $6}')
+    COOKIE_WP_LI_AUTH=$(grep <$FILE_COOKIE_LOGIN "wordpress_logged_in" |
+        awk '{print $7}')
+
+    # summarize
+    #debug " NONCE = $NONCE"
+    #debug " COOKIE_WP_ID = $COOKIE_WP_ID"
+    #debug " COOKIE_WP_ID_AUTH = $COOKIE_WP_ID_AUTH"
+    #debug " COOKIE_WP_LI = $COOKIE_WP_LI"
+    #debug " COOKIE_WP_LI_AUTH = $COOKIE_WP_LI_AUTH"
+
+    curl -s \
+        "$SITE/wp-admin/admin.php?page=qmn_addons&tab=export-results" \
+        --header "Cookie: $COOKIE_WP_ID=$COOKIE_WP_ID_AUTH; \
+        wordpress_test_cookie=WP+Cookie+check; \
+        $COOKIE_WP_LI=$COOKIE_WP_LI_AUTH" \
+        --data-binary "export_quiz_id=$QUIZ_ID&date_start=&date_end=& \
+        timestamp=1&contact=1&user=1&quizName=1&questions=1&useranswer=1& \
+        userComments=1&rightWrong=1&questionPoint=1&category=1& \
+        totalCorrect=1&totalQuestion=1&score=1&commentSection=1&timer=1& \
+        export_results_nonce=$NONCE&_wp_http_referer=%2Fwp-admin%2Fadmin.php \
+        %3Fpage%3Dqmn_addons%26tab%3Dexport-results" \
+        --output $FILE_CACHE_QSMDONE
+    wait
+
+    # verify
+    if ! grep -q "Success" $FILE_CACHE_QSMDONE; then
+        echo " Error during export"
+        exit 1
+    fi
+}
+
+# exporting all quizzes to csv via QSM export
+move_all_quizzes() {
+    debug "move_all_quizzes()"
+
+    local QUIZ_LIST
+    local QUIZ_ID
+    local COUNTER
+
+    # download the initial site that contains quiz-IDs and nonce
+    qsm_export_download_site
+
+    # remove eventual old csv files
+    rm -f "$PATH_EXPORTS"/expoted_results_*.csv
+    rm -f "$PATH_SAVE_TO"/*.csv
+
+    # get a list of quizzes
+    QUIZ_LIST=$(tidy <$FILE_CACHE_QSMEXP -w -q 2>/dev/null |
+        grep "option value" |
+        cut -d '"' -f2)
+
+    # export each quiz
+    for QUIZ_ID in $QUIZ_LIST; do
+        # export each quiz
+        qsm_export_single_quiz_to_csv "$QUIZ_ID"
+        # find the latest quiz file
+        # shellcheck disable=SC2010
+        LATEST_CSV=$(ls -t1 "$PATH_EXPORTS" | grep .csv | head -n 1)
+        # verify that there is a csv file
+        if [ -z "${LATEST_CSV}" ]; then
+            echo " There is no CSV file in $PATH_EXPORTS" && exit 1
+        fi
+        # move the csv to the PATH_SAVE_TO folder
+        cp -f "$PATH_EXPORTS/$LATEST_CSV" "$PATH_SAVE_TO/$QUIZ_ID.csv"
+        COUNTER=$((COUNTER + 1))
+    done
+    debug " Done with a total of $COUNTER quizzes"
+}
+
+main() {
+    # load config
+    load_config
+
+    # prepare a temp folder
+    mkdir -p "$WEBTEMP" || exit 1
+    cd "$WEBTEMP" || exit 1
+
+    # cleanup old cache
+    rm -f cache-*.html
+    rm -f cookie-*.txt
+
+    # export all quizzes
+    login_to_wordpress
+    move_all_quizzes
+
+    # exit
+    cd .. || exit 1
+}
+
+###### MAIN ###################################################################
+
+if [ "$PARAMETER" = "debug" ]; then
+    {
+        main
+    } | tee "$PATH_CFG/qsm-to-qsmcsv.log"
+else
+    main
+fi
